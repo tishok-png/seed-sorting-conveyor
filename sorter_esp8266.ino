@@ -1,77 +1,66 @@
 /* =====================================================================
    AUTOMATED SEED SORTING SYSTEM
-   ESP8266 (NodeMCU) actuation firmware — motors + LED, over WiFi
+   ESP8266 (NodeMCU) actuation firmware — motors + LED only
    =====================================================================
 
    ROLE IN THE SYSTEM
    -------------------
-   The Raspberry Pi does camera capture, seed classification, and the
-   reject servo + its FIFO timing (see reject_actuator.py, driven from
-   a Pi GPIO pin). This board's job is exactly: the conveyor belt
-   motor, the singulation motor, and the indicator LED. It has no
-   servo, no diverter, no FIFO, and no longer needs to know which
-   seeds were GOOD or BAD — that lives entirely on the Pi.
+   The Raspberry Pi does camera capture, seed classification, AND the
+   reject servo + its FIFO timing. This firmware's job is exactly:
+   the conveyor belt motor, the singulation motor, and the indicator LED.
 
-   TRANSPORT: WIFI, NOT USB SERIAL
-   -------------------------------------------------------------------
-   The Pi no longer talks to this board over a USB cable. This board
-   connects to your WiFi (WIFI_SSID/WIFI_PASSWORD below) and runs a
-   small TCP server; the Pi connects to it as a client. The command
-   protocol itself (checksummed lines, same verbs) is unchanged from
-   the serial version — only the wire it travels over changed.
+   TRANSPORT  (changed from USB serial to TCP/WiFi)
+   -------------------
+   The Pi connects as a TCP CLIENT to port 8266 on this board.
+   This firmware exposes the board at:
 
-   Two real tradeoffs versus USB serial, worth knowing before you rely
-   on this: (1) this board's single core now runs the WiFi stack and
-   the stepper pulse generation (AccelStepper) at the same time, which
-   can introduce small belt/singulator timing jitter that wasn't there
-   over serial — WIFI_NONE_SLEEP below reduces but doesn't eliminate
-   this. (2) if the WiFi link drops while RUNNING or in CALIBRATION,
-   the Pi has no way to send STOP until it reconnects — this firmware
-   stops the motors on its own the moment it notices the link is down
-   (see checkWiFi()), but a physical E-stop on motor power is still
-   the real safety backstop, same as it always was.
+       seedsorter.local   (mDNS hostname)   port 8266
+
+   which matches ESP_HOST = "seedsorter.local" and ESP_PORT = 8266
+   in sorter_pi_agent.py. USB serial is retained for local debug only
+   (you can type the same commands into a serial monitor and you will
+   see every state echo there too). Do NOT drive both links at once.
 
    LIBRARIES REQUIRED
    -------------------------------------------------------------------
-   AccelStepper (by Mike McCauley) — both stepper motors.
-   ESP8266WiFi and ESP8266mDNS — bundled with the ESP8266 Arduino core.
+     AccelStepper  (by Mike McCauley)    both stepper motors
+     ESP8266WiFi   (bundled w/ core)     TCP transport
+     ESP8266mDNS   (bundled w/ core)     seedsorter.local
 
-   PROTOCOL (from the Pi, one line per command, checksummed)
+   WIRE PROTOCOL  (unchanged; same as the old serial version)
    -------------------------------------------------------------------
-     Every line has the form   PAYLOAD*CK\n
+     Every command line has the form   PAYLOAD*CK\n
      where CK is a 2-digit uppercase hex XOR checksum of every byte in
-     PAYLOAD. A line that fails the checksum is ignored and answered
-     with "ERR CHECKSUM" so you can see it happening on the Pi's log.
+     PAYLOAD. A line that fails the checksum is answered "ERR CHECKSUM".
 
      RUN            -> start belt + singulator + LED
      STOP           -> stop everything. Always allowed, from any state.
-     CALIBRATE      -> run belt + singulator continuously at level 1 for
-                       physical alignment work.
-     SPD1 / SPD2 / SPD3 -> set the speed level directly (matches the
-                       dashboard's 3 speed buttons). Also applied live if
-                       already RUNNING or in CALIBRATION.
-     SPD+ / SPD-    -> step the speed level up/down by one (kept for
-                       compatibility; same live-apply behaviour as above).
-     TESTBELT       -> hardware bring-up only: spins ONLY the belt motor
-                       for 3 seconds at a fixed diagnostic speed. Rejected
-                       with ERR STOP_FIRST unless currently IDLE.
-     TESTSING       -> same, but for ONLY the singulator motor.
-     TESTLED        -> same, but for the indicator LED.
+     CALIBRATE      -> run belt + singulator at level 1 for alignment.
+     SPD1 / SPD2 / SPD3 -> set the speed level directly.
+     SPD+ / SPD-    -> step the speed level up/down by one.
+     TESTBELT       -> IDLE only: spin ONLY belt for 3 s.
+     TESTSING       -> IDLE only: spin ONLY singulator for 3 s.
+     TESTLED        -> IDLE only: flash the LED for 3 s.
+
+   Responses (READY / STATE ... / TEST ... / ERR ...) are plain lines
+   with no checksum — the Pi's read_lines() does not verify them, and
+   the Pi's _wait_ready() looks for the literal token "READY".
 
    MACHINE STATE
    -------------------------------------------------------------------
-   Every state transition is echoed back as "STATE IDLE" / "STATE
-   RUNNING" / "STATE CALIBRATION" so the Pi always reflects what the
-   motors actually did, not just what they were asked to do. There is
-   no FAULT state here — the only thing that used to trigger one (the
-   reject FIFO overflowing) no longer happens on this board. If the
-   Pi's own reject FIFO overflows, the Pi sends this board a STOP and
-   reports its own FAULT upstream.
+   Every state transition echoes "STATE IDLE" / "STATE RUNNING" /
+   "STATE CALIBRATION". No FAULT state on this board anymore — FAULT
+   is a Pi-level concept (reject FIFO overflow).
 
-   HOW TO CHANGE THINGS
+   POST-SWAP NOTES (belt on D2, singulator on D5/D6)
    -------------------------------------------------------------------
-   Everything you're likely to tune lives in the USER CONFIGURATION
-   block right below.
+   * Belt DIR is hardwired to 3V3 — direction cannot be changed from
+     firmware. Swap a motor coil pair at the driver to reverse.
+   * Singulator DIR is now on D6 (was hardwired HIGH). Inverted below
+     via setPinsInverted(true,false,false) to preserve the physical
+     direction; flip that boolean if it spins the wrong way.
+   * SINGULATION_STEPS_PER_SEC is normalized by STEPS_PER_REV / 200 so
+     the nominal values stay meaningful regardless of microstepping.
    ===================================================================== */
 
 #include <ESP8266WiFi.h>
@@ -79,96 +68,95 @@
 #include <AccelStepper.h>
 
 /* =====================================================================
-   USER CONFIGURATION — change these to match your build
+   USER CONFIGURATION — EDIT THE TWO WIFI STRINGS
    ===================================================================== */
 
-// ---- WiFi ----
-const char* WIFI_SSID = "G";
-const char* WIFI_PASSWORD = "66666622";
-const char* MDNS_HOSTNAME = "seedsorter";  // Pi connects to seedsorter.local
-const uint16_t TCP_PORT = 8266;
+// *** EDIT THESE ***
+const char* WIFI_SSID     = "G";
+const char* WIFI_PASS     = "66666622";
 
-// ---- Pins (as wired) ----
-#define PIN_M1_STEP       D5   // Motor 1 (conveyor belt) STEP
-#define PIN_M1_DIR        D6   // Motor 1 DIR
-#define PIN_M2_STEP       D2   // Motor 2 (singulator) STEP — DIR is hardwired to 3V3
-#define PIN_M2_DIR_UNUSED D0   // Not physically connected; AccelStepper's DRIVER mode
-                                // needs a dir-pin argument even though motor 2's real
-                                // DIR pin is hardwired to 3V3. Has no hardware effect.
-#define PIN_LED_MOSFET    D7   // MOSFET gate driving the indicator LED
+// Hostname this board advertises via mDNS. "seedsorter" makes the board
+// reachable at seedsorter.local — which is what the Pi's ESP_HOST is set to.
+const char* MDNS_HOSTNAME = "seedsorter";
 
-// ---- Conveyor mechanics (used to convert "belt speed" into a step rate) ----
-// Drivetrain: motor -> 3:1 gearbox -> small pulley -> belt -> big pulley on
-// roller shaft -> roller -> conveyor belt.
+// TCP port the Pi connects to. Matches ESP_PORT in sorter_pi_agent.py.
+const uint16_t TCP_PORT   = 8266;
+
+// ---- Pins (as wired, after the motor swap) ----
+#define PIN_M1_STEP       D2   // Belt STEP — DIR hardwired to 3V3
+#define PIN_M1_DIR_UNUSED D0   // Dummy DIR for belt; not connected. No effect.
+#define PIN_M2_STEP       D5   // Singulator STEP
+#define PIN_M2_DIR        D6   // Singulator DIR (was hardwired 3V3 before swap)
+#define PIN_LED_MOSFET    D7   // MOSFET gate for the indicator LED
+
+// ---- Serial: local debug only now, NOT the Pi link ----
+#define PI_BAUD_RATE      115200
+
+// ---- Conveyor mechanics ----
 const float ROLLER_DIAMETER_MM       = 40.0;
 const float DRIVE_PULLEY_DIAMETER_MM = 90.0;
-const float MOTOR_PULLEY_DIAMETER_MM = 12.0;  // *** CONFIRM THIS *** placeholder —
-                                               // measure the motor/gearbox output
-                                               // pulley and update before trusting speed.
+// *** MEASURE THIS *** Real motor/gearbox output pulley. 8.0 is a
+// reasonable placeholder; lower = faster belt. Raise
+// BELT_SPEED_MULTIPLIER instead if you don't want to touch this.
+const float MOTOR_PULLEY_DIAMETER_MM = 8.0;
 const float GEARBOX_RATIO            = 3.0;
-const int   STEPS_PER_REV            = 200;   // 1.8 deg/step, full-step. Multiply here
-                                               // if your DRV8825 MSx pins are set for
-                                               // microstepping (e.g. 1600 for 1/8).
 
-// Desired conveyor belt speeds for the 3 run levels, in cm/s.
-// IMPORTANT: this is the TARGET the ESP commands the motor to reach from
-// the pulley/gearbox math above — it is not necessarily the speed the belt
-// actually achieves (that depends on MOTOR_PULLEY_DIAMETER_MM being right,
-// plus slip/friction). reject_actuator.py on the Pi uses the separately
-// MEASURED real speed for reject timing, which is why the two lists don't
-// have to be identical, only level 1 vs 2 vs 3 meaning the same thing.
-const float BELT_SPEED_CM_S[3] = { 3.14, 6.2, 7.4 };
+// MUST match your DRV8825 MS1/MS2/MS3 jumpers:
+//   full=200, 1/2=400, 1/4=800, 1/8=1600, 1/16=3200, 1/32=6400
+const int   STEPS_PER_REV            = 200;
 
-// Singulation motor step rate for each level, in steps/sec.
+// Belt speed targets per level (cm/s). Keep in sync with
+// BELT_SPEED_CM_S_BY_LEVEL in sorter_pi_agent.py.
+const float BELT_SPEED_CM_S[3] = { 6.5, 12.0, 16.0 };
+const float BELT_SPEED_MULTIPLIER = 1.5;
+
+// Singulator step rate per level, expressed as full-step-equivalent
+// steps/sec. In applySpeedLevel() these are scaled by
+// (STEPS_PER_REV / 200.0) so microstepping doesn't slow the singulator.
 const float SINGULATION_STEPS_PER_SEC[3] = { 150.0, 250.0, 350.0 };
+// Extra fudge factor on top. Raise if the singulator still feels weak.
+const float SINGULATION_SPEED_MULTIPLIER = 1.0;
 
 /* =====================================================================
-   Below here is logic — you shouldn't need to edit this for normal tuning
+   Logic — no edits needed below for normal tuning
    ===================================================================== */
-
-WiFiServer tcpServer(TCP_PORT);
-WiFiClient piClient;
 
 enum SystemState { STATE_IDLE, STATE_RUNNING, STATE_CALIBRATION };
 SystemState currentState = STATE_IDLE;
 
-// --- Hardware bring-up test mode ---
-// TESTBELT / TESTSING / TESTLED drive exactly one actuator for a few
-// seconds, independent of RUN/STOP, so you can identify which physical
-// part is wired to which pins one at a time instead of guessing from
-// RUN (which drives both motors together). Only allowed while IDLE.
 enum TestKind { TEST_NONE, TEST_BELT, TEST_SINGULATOR, TEST_LED };
 TestKind activeTest = TEST_NONE;
 unsigned long testEndAt = 0;
 const unsigned long TEST_DURATION_MS = 3000;
-const float TEST_STEPS_PER_SEC = 200.0; // fixed, modest diagnostic speed — not tied to speedLevel
+const float TEST_STEPS_PER_SEC = 200.0;
 
-int speedLevel = 1; // 1..3, index into the arrays above (arrays are 0-based)
+int speedLevel = 1; // 1..3
 
-// AccelStepper handles all pulse timing for both motors, non-blocking.
-AccelStepper beltMotor(AccelStepper::DRIVER, PIN_M1_STEP, PIN_M1_DIR);
-AccelStepper singulatorMotor(AccelStepper::DRIVER, PIN_M2_STEP, PIN_M2_DIR_UNUSED);
+AccelStepper beltMotor(AccelStepper::DRIVER, PIN_M1_STEP, PIN_M1_DIR_UNUSED);
+AccelStepper singulatorMotor(AccelStepper::DRIVER, PIN_M2_STEP, PIN_M2_DIR);
 
-// Incoming line buffer (from the Pi's TCP connection)
+// ---- TCP server + client ----
+WiFiServer server(TCP_PORT);
+WiFiClient client;
+
+// ---- Line buffers, one per input source so partial commands from the
+//      serial monitor can never get spliced with TCP bytes ----
 String serialLine = "";
+String tcpLine    = "";
 
-/* ---------------------------------------------------------------------
-   Reply to the Pi (if connected) and to the USB serial monitor (if
-   attached) at the same time — Serial is debug-only now, not the
-   command channel, but it's still useful for watching what's happening
-   with a cable plugged in during bring-up.
-   --------------------------------------------------------------------- */
-void reply(const String &text) {
-  Serial.println(text);
-  if (piClient && piClient.connected()) {
-    piClient.println(text);
-  }
+// ---- Emit one line to BOTH the local serial monitor and the Pi ----
+void emit(const __FlashStringHelper* msg) {
+  Serial.println(msg);
+  if (client && client.connected()) client.println(msg);
 }
 
-/* ---------------------------------------------------------------------
-   Speed math: turn a target belt speed (cm/s) into a step rate for
-   AccelStepper.
-   --------------------------------------------------------------------- */
+void emit(const String& msg) {
+  Serial.println(msg);
+  if (client && client.connected()) client.println(msg);
+}
+
+// ---------- Motor helpers ----------
+
 float beltSpeedToStepsPerSec(float beltSpeedCmS) {
   float rollerCirc_cm = (PI * ROLLER_DIAMETER_MM) / 10.0;
   float rollerRPS     = beltSpeedCmS / rollerCirc_cm;
@@ -180,23 +168,25 @@ float beltSpeedToStepsPerSec(float beltSpeedCmS) {
 void applySpeedLevel() {
   int i = speedLevel - 1;
 
-  float beltStepsPerSec = beltSpeedToStepsPerSec(BELT_SPEED_CM_S[i]);
-  beltMotor.setMaxSpeed(beltStepsPerSec * 1.2);
+  float beltStepsPerSec = beltSpeedToStepsPerSec(BELT_SPEED_CM_S[i])
+                          * BELT_SPEED_MULTIPLIER;
+  beltMotor.setMaxSpeed(beltStepsPerSec * 2.0);
   beltMotor.setSpeed(beltStepsPerSec);
 
-  float singStepsPerSec = SINGULATION_STEPS_PER_SEC[i];
-  singulatorMotor.setMaxSpeed(singStepsPerSec * 1.2);
+  // Scale singulator for microstepping so physical speed is stable.
+  float microScale       = (float)STEPS_PER_REV / 200.0;
+  float singStepsPerSec  = SINGULATION_STEPS_PER_SEC[i]
+                           * microScale
+                           * SINGULATION_SPEED_MULTIPLIER;
+  singulatorMotor.setMaxSpeed(singStepsPerSec * 2.0);
   singulatorMotor.setSpeed(singStepsPerSec);
 }
 
-/* ---------------------------------------------------------------------
-   State transitions
-   --------------------------------------------------------------------- */
 void startRunning() {
   currentState = STATE_RUNNING;
   applySpeedLevel();
   digitalWrite(PIN_LED_MOSFET, HIGH);
-  reply(F("STATE RUNNING"));
+  emit(F("STATE RUNNING"));
 }
 
 void stopRunning() {
@@ -204,42 +194,40 @@ void stopRunning() {
   beltMotor.setSpeed(0);
   singulatorMotor.setSpeed(0);
   digitalWrite(PIN_LED_MOSFET, LOW);
-  reply(F("STATE IDLE"));
+  emit(F("STATE IDLE"));
 }
 
 void startCalibration() {
   currentState = STATE_CALIBRATION;
-  speedLevel = 1; // calibration always runs at the slowest, safest level
+  speedLevel = 1;
   applySpeedLevel();
   digitalWrite(PIN_LED_MOSFET, HIGH);
-  reply(F("STATE CALIBRATION"));
+  emit(F("STATE CALIBRATION"));
 }
 
-/* ---------------------------------------------------------------------
-   Hardware bring-up test mode — one actuator at a time, independent of
-   RUN/STOP, so you can identify which physical part is on which pins.
-   --------------------------------------------------------------------- */
 void startTest(TestKind kind) {
   if (currentState != STATE_IDLE) {
-    reply(F("ERR STOP_FIRST"));
+    emit(F("ERR STOP_FIRST"));
     return;
   }
   activeTest = kind;
-  testEndAt = millis() + TEST_DURATION_MS;
+  testEndAt  = millis() + TEST_DURATION_MS;
+  // Same microstepping-aware scaling for the singulator test.
+  float microScale = (float)STEPS_PER_REV / 200.0;
   switch (kind) {
     case TEST_BELT:
       beltMotor.setMaxSpeed(TEST_STEPS_PER_SEC * 1.2);
       beltMotor.setSpeed(TEST_STEPS_PER_SEC);
-      reply(F("TEST BELT_STARTED"));
+      emit(F("TEST BELT_STARTED"));
       break;
     case TEST_SINGULATOR:
-      singulatorMotor.setMaxSpeed(TEST_STEPS_PER_SEC * 1.2);
-      singulatorMotor.setSpeed(TEST_STEPS_PER_SEC);
-      reply(F("TEST SINGULATOR_STARTED"));
+      singulatorMotor.setMaxSpeed(TEST_STEPS_PER_SEC * microScale * 1.2);
+      singulatorMotor.setSpeed(TEST_STEPS_PER_SEC * microScale);
+      emit(F("TEST SINGULATOR_STARTED"));
       break;
     case TEST_LED:
       digitalWrite(PIN_LED_MOSFET, HIGH);
-      reply(F("TEST LED_STARTED"));
+      emit(F("TEST LED_STARTED"));
       break;
     default:
       break;
@@ -248,20 +236,19 @@ void startTest(TestKind kind) {
 
 void serviceTest() {
   if (activeTest == TEST_NONE) return;
-  if (activeTest == TEST_BELT) beltMotor.runSpeed();
+  if (activeTest == TEST_BELT)       beltMotor.runSpeed();
   if (activeTest == TEST_SINGULATOR) singulatorMotor.runSpeed();
   if ((long)(millis() - testEndAt) >= 0) {
     beltMotor.setSpeed(0);
     singulatorMotor.setSpeed(0);
     digitalWrite(PIN_LED_MOSFET, LOW);
     activeTest = TEST_NONE;
-    reply(F("TEST DONE"));
+    emit(F("TEST DONE"));
   }
 }
 
-/* ---------------------------------------------------------------------
-   Checksum framing: PAYLOAD*CK  where CK is a 2-digit hex XOR of PAYLOAD.
-   --------------------------------------------------------------------- */
+// ---------- Protocol ----------
+
 bool checkAndStrip(String &line) {
   int star = line.lastIndexOf('*');
   if (star < 0 || (int)line.length() - star != 3) return false;
@@ -273,148 +260,159 @@ bool checkAndStrip(String &line) {
   return true;
 }
 
-/* ---------------------------------------------------------------------
-   Command handling
-   --------------------------------------------------------------------- */
 void handleCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
   if (!checkAndStrip(cmd)) {
-    reply(F("ERR CHECKSUM"));
+    emit(F("ERR CHECKSUM"));
     return;
   }
 
   bool liveApply = (currentState == STATE_RUNNING || currentState == STATE_CALIBRATION);
 
-  if (cmd == "RUN") {
-    startRunning();
-  } else if (cmd == "STOP") {
-    stopRunning();
-  } else if (cmd == "CALIBRATE") {
-    startCalibration();
-  } else if (cmd == "SPD1") {
-    speedLevel = 1;
-    if (liveApply) applySpeedLevel();
-  } else if (cmd == "SPD2") {
-    speedLevel = 2;
-    if (liveApply) applySpeedLevel();
-  } else if (cmd == "SPD3") {
-    speedLevel = 3;
-    if (liveApply) applySpeedLevel();
-  } else if (cmd == "SPD+") {
-    if (speedLevel < 3) speedLevel++;
-    if (liveApply) applySpeedLevel();
-  } else if (cmd == "SPD-") {
-    if (speedLevel > 1) speedLevel--;
-    if (liveApply) applySpeedLevel();
-  } else if (cmd == "TESTBELT") {
-    startTest(TEST_BELT);
-  } else if (cmd == "TESTSING") {
-    startTest(TEST_SINGULATOR);
-  } else if (cmd == "TESTLED") {
-    startTest(TEST_LED);
-  } else {
-    reply(F("ERR UNKNOWN_CMD"));
+  if      (cmd == "RUN")       startRunning();
+  else if (cmd == "STOP")      stopRunning();
+  else if (cmd == "CALIBRATE") startCalibration();
+  else if (cmd == "SPD1") { speedLevel = 1; if (liveApply) applySpeedLevel(); }
+  else if (cmd == "SPD2") { speedLevel = 2; if (liveApply) applySpeedLevel(); }
+  else if (cmd == "SPD3") { speedLevel = 3; if (liveApply) applySpeedLevel(); }
+  else if (cmd == "SPD+") { if (speedLevel < 3) speedLevel++; if (liveApply) applySpeedLevel(); }
+  else if (cmd == "SPD-") { if (speedLevel > 1) speedLevel--; if (liveApply) applySpeedLevel(); }
+  else if (cmd == "TESTBELT") startTest(TEST_BELT);
+  else if (cmd == "TESTSING") startTest(TEST_SINGULATOR);
+  else if (cmd == "TESTLED")  startTest(TEST_LED);
+  else emit(F("ERR UNKNOWN_CMD"));
+}
+
+// ---------- Link plumbing ----------
+
+void acceptClient() {
+  if (client && client.connected()) return;
+  if (client) client.stop();          // clean up a dead handle
+  WiFiClient newClient = server.available();
+  if (newClient) {
+    client = newClient;
+    client.setNoDelay(true);          // state echoes go out immediately
+    tcpLine = "";                     // never splice with an old session
+    Serial.println(F("TCP client connected"));
+    client.println(F("READY"));       // Pi's _wait_ready() looks for this
   }
 }
 
-/* ---------------------------------------------------------------------
-   TCP client handling — accepts one Pi connection at a time. If the Pi
-   disconnects and reconnects (its own retry logic, or a Wi-Fi blip),
-   this just accepts the new connection; no reboot needed on this side.
-   --------------------------------------------------------------------- */
-void pollClient() {
-  if (!piClient || !piClient.connected()) {
-    WiFiClient newClient = tcpServer.available();
-    if (newClient) {
-      piClient = newClient;
-      Serial.println(F("Pi connected."));
-      piClient.println(F("READY"));
+void pollLinks() {
+  // --- Pi over TCP ---
+  if (client && client.connected()) {
+    while (client.available() > 0) {
+      char c = client.read();
+      if (c == '\n') {
+        handleCommand(tcpLine);
+        tcpLine = "";
+      } else if (c != '\r') {
+        if (tcpLine.length() < 64) tcpLine += c;
+      }
     }
-    return;
   }
-  while (piClient.available() > 0) {
-    char c = piClient.read();
+  // --- local serial debug ---
+  while (Serial.available() > 0) {
+    char c = Serial.read();
     if (c == '\n') {
       handleCommand(serialLine);
       serialLine = "";
     } else if (c != '\r') {
-      if (serialLine.length() < 64) serialLine += c; // guard against a runaway line
+      if (serialLine.length() < 64) serialLine += c;
     }
   }
 }
 
-/* ---------------------------------------------------------------------
-   If Wi-Fi drops while the motors are moving, there is no way for the
-   Pi to send STOP until it reconnects — so stop on our own rather than
-   keep running blind. A physical E-stop on motor power is still the
-   real backstop; this is a software safety net, not a replacement.
-   --------------------------------------------------------------------- */
-void checkWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (currentState != STATE_IDLE) {
-      beltMotor.setSpeed(0);
-      singulatorMotor.setSpeed(0);
-      digitalWrite(PIN_LED_MOSFET, LOW);
-      currentState = STATE_IDLE;
-      Serial.println(F("WiFi lost while active — stopped for safety."));
-    }
-    WiFi.reconnect();
-  }
-}
+// ---------- setup / loop ----------
 
-/* =====================================================================
-   Arduino entry points
-   ===================================================================== */
 void setup() {
   pinMode(PIN_LED_MOSFET, OUTPUT);
   digitalWrite(PIN_LED_MOSFET, LOW);
 
-  // If the belt runs backward once tested, uncomment the next line
-  // instead of rewiring: beltMotor.setPinsInverted(true, false, false);
+  pinMode(PIN_M1_STEP, OUTPUT);
+  pinMode(PIN_M2_STEP, OUTPUT);
+  pinMode(PIN_M2_DIR,  OUTPUT);
+
+  // Singulator's DIR used to be hardwired HIGH; it's now driven LOW by
+  // AccelStepper. Invert logical direction to restore the original
+  // physical direction. Flip to false if it spins the wrong way.
+  singulatorMotor.setPinsInverted(true, false, false);
+
   beltMotor.setSpeed(0);
   singulatorMotor.setSpeed(0);
 
-  Serial.begin(115200); // debug output only now — the command channel is WiFi
-  Serial.println();
-  Serial.print(F("Connecting to WiFi: "));
-  Serial.println(WIFI_SSID);
+  // DRV8825 needs >= 1.9 us step pulses. 3 gives margin.
+  beltMotor.setMinPulseWidth(3);
+  singulatorMotor.setMinPulseWidth(3);
 
+  Serial.begin(PI_BAUD_RATE);
+  Serial.println(F("READY (local)"));
+
+  // ---- WiFi ----
+  WiFi.persistent(false);               // don't wear out flash on every boot
   WiFi.mode(WIFI_STA);
-  WiFi.setSleepMode(WIFI_NONE_SLEEP); // reduces (not eliminates) WiFi-induced
-                                       // timing jitter in the stepper loop
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
+  WiFi.hostname(MDNS_HOSTNAME);         // DHCP hostname -> seedsorter
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print(F("Connecting to WiFi"));
+  unsigned long deadline = millis() + 20000;
+  while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
     delay(250);
-    Serial.print(".");
+    Serial.print('.');
   }
   Serial.println();
-  Serial.print(F("WiFi connected. IP address: "));
-  Serial.println(WiFi.localIP());
-
-  if (MDNS.begin(MDNS_HOSTNAME)) {
-    Serial.print(F("mDNS responder started — the Pi can connect to "));
-    Serial.print(MDNS_HOSTNAME);
-    Serial.println(F(".local"));
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F("WiFi OK, IP: "));
+    Serial.println(WiFi.localIP());
   } else {
-    Serial.println(F("mDNS failed to start — connect using the IP address above instead."));
+    Serial.println(F("WiFi not connected yet — will keep trying. "
+                     "If you need control NOW, reset the board."));
   }
-
-  tcpServer.begin();
-  Serial.print(F("TCP server listening on port "));
-  Serial.println(TCP_PORT);
 }
 
 void loop() {
-  checkWiFi();
-  MDNS.update();
-  pollClient();
-
-  if (currentState == STATE_RUNNING || currentState == STATE_CALIBRATION) {
-    beltMotor.runSpeed();       // non-blocking — call every loop for smooth, even steps
-    singulatorMotor.runSpeed();
+  // Start the TCP server + mDNS exactly once, after WiFi is actually up.
+  static bool netReady = false;
+  if (!netReady && WiFi.status() == WL_CONNECTED) {
+    netReady = true;
+    server.begin();
+    server.setNoDelay(true);
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+      MDNS.addService("seed_sorter", "tcp", TCP_PORT);
+    }
+    Serial.print(F("TCP listening on "));
+    Serial.print(WiFi.localIP());
+    Serial.print(F(":"));
+    Serial.println(TCP_PORT);
+    Serial.print(F("mDNS hostname: "));
+    Serial.print(MDNS_HOSTNAME);
+    Serial.println(F(".local"));
   }
 
-  serviceTest(); // runs independently of RUN/STOP, only while a test is active
+  // Safety net: if we were connected and WiFi has been gone for >30 s,
+  // restart — mid-run reconnects are flakier than a fresh boot.
+  static unsigned long wifiLostAt = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiLostAt = 0;
+  } else if (netReady) {
+    if (!wifiLostAt) wifiLostAt = millis();
+    else if (millis() - wifiLostAt > 30000UL) {
+      Serial.println(F("WiFi lost >30 s — restarting board"));
+      ESP.restart();
+    }
+  }
+
+  acceptClient();
+  pollLinks();
+
+  if (currentState == STATE_RUNNING || currentState == STATE_CALIBRATION) {
+    beltMotor.runSpeed();
+    singulatorMotor.runSpeed();
+  }
+  serviceTest();
+
+  MDNS.update();
 }
