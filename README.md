@@ -1,4 +1,8 @@
 Automated Maize Seed Sorting System
+
+firebase link "https://console.firebase.google.com/u/0/project/maize-sorting/database/maize-sorting-default-rtdb/data/~2F"
+streamlit app "https://cccgnakbcnhsp5mszbdh8q.streamlit.app/"
+
 An automated maize seed sorting system that uses computer vision and a machine-learning model to identify good seeds, bad seeds, and objects that are not maize. A Raspberry Pi handles camera capture, classification, sorting decisions, and the reject servo, while an ESP8266 controls the conveyor and singulation motors. A Streamlit dashboard provides machine monitoring and operator controls.
 Table of Contents
 Project Overview
