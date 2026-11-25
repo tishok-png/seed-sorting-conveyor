@@ -2,32 +2,42 @@
 app.py - Operator Monitoring & Control Dashboard
 Automated Seed Sorting System
 
-Professional dashboard layout:
-  - Top bar with brand, connection mode and live connection status
-  - KPI cards (status, diverter, good, bad, total) with line icons
-  - Dedicated camera monitor panel (LIVE badge, framed viewport, timestamp)
-  - Control panel (start / stop / belt speed / calibrate / servo test)
+Dark theme dashboard:
+  - Top bar with brand, connection mode, servo mode and connection status
+  - KPI cards (status, diverter, good, bad, total)
+  - Camera monitor panel
+  - Control panel (start / stop / belt speed / calibrate / servo AUTO-MANUAL)
   - Analytics cards (trend line, good-vs-bad bar, good rate)
   - History tab with per-session graphs and CSV downloads
+  - Sidebar: Cloud or WebSocket connection + Pi WiFi setup
+
+Two ways to talk to the Pi:
+  Cloud      Firebase, works from anywhere with internet (slower)
+  WebSocket  direct link on the same WiFi network (fast, low delay)
 
 Run with:
     streamlit run app.py
+(put config.toml in a ".streamlit" folder next to this file for the full dark theme)
 """
 
 import base64
+import json
 from datetime import datetime
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from serial_bridge import SerialBridge, SimulationBridge
+from websocket_bridge import WebSocketBridge
 from cloud_bridge import CloudBridge
 
 # --------------------------------------------------------------------------
 # Saved settings - edit here once, never type it again
 # --------------------------------------------------------------------------
-DEFAULT_FIREBASE_URL = "https://maize-sorting-default-rtdb.firebaseio.com/seed_sorting"
+DEFAULT_FIREBASE_URL = "https://maize-sorting-default-rtdb.firebaseio.com/"
+DEFAULT_PI_HOST = "raspberrypi.local"   # the Pi's hostname or IP address
+DEFAULT_WS_PORT = 8765                  # must match WS_PORT in sorter_agent.py
+DEFAULT_WS_KEY = "seedsorter"           # must match WS_ACCESS_KEY in sorter_agent.py
 
 # --------------------------------------------------------------------------
 # Page setup
@@ -40,14 +50,18 @@ st.set_page_config(
 
 MODE_OPTIONS = [
     "Cloud (WiFi - check from anywhere)",
-    "Live (Raspberry Pi over USB)",
-    "Simulation (no hardware)",
+    "WebSocket (same WiFi - fastest)",
 ]
+
+SERVO_AUTO = "Autonomous"
+SERVO_MANUAL = "Manual"
 
 if "bridge" not in st.session_state:
     st.session_state.bridge = None
-if "mode" not in st.session_state:
+if "mode" not in st.session_state or st.session_state.mode not in MODE_OPTIONS:
     st.session_state.mode = MODE_OPTIONS[0]
+if "servo_mode" not in st.session_state:
+    st.session_state.servo_mode = SERVO_AUTO
 if "live_series" not in st.session_state:
     st.session_state.live_series = []
 if "sessions" not in st.session_state:
@@ -56,28 +70,34 @@ if "active_session" not in st.session_state:
     st.session_state.active_session = None
 if "last_run_series" not in st.session_state:
     st.session_state.last_run_series = []
+if "wifi_msg" not in st.session_state:
+    st.session_state.wifi_msg = None
 
-# ---- palette ----
-NAVY = "#0F172A"
-NAVY_2 = "#1E293B"
-INDIGO = "#4F46E5"
-INDIGO_LIGHT = "#EEF2FF"
+# ---- dark palette ----
+BG = "#0B1120"          # page background
+SIDEBAR_BG = "#080D1A"
+CARD = "#111827"        # cards / panels
+CARD_2 = "#1E293B"      # inputs, raised surfaces
+BORDER = "#263449"
+TEXT_MAIN = "#E2E8F0"
+TEXT_MUTED = "#94A3B8"
+
+SKY = "#7DD3FC"         # light blue (buttons + accents)
+SKY_HOVER = "#BAE6FD"
+ON_SKY = "#0B1120"      # text colour on light-blue buttons
+SKY_BG = "rgba(125,211,252,0.14)"
+
 GREEN = "#10B981"
-GREEN_LIGHT = "#D1FAE5"
+GREEN_BG = "rgba(16,185,129,0.16)"
 RED = "#EF4444"
-RED_LIGHT = "#FEE2E2"
-BLUE = "#3B82F6"
-BLUE_LIGHT = "#DBEAFE"
+RED_BG = "rgba(239,68,68,0.16)"
 AMBER = "#F59E0B"
-AMBER_LIGHT = "#FEF3C7"
-GRAY_LIGHT = "#F1F5F9"
-TEXT_DARK = "#0F172A"
-TEXT_MUTED = "#64748B"
-BORDER = "#E2E8F0"
+AMBER_BG = "rgba(245,158,11,0.16)"
+GRAY_BG = "rgba(148,163,184,0.16)"
 
 SPEED_LEVELS = [(1, 3.75), (2, 6.2), (3, 7.4)]
 
-GOOD_COLOR, BAD_COLOR, TOTAL_COLOR = GREEN, RED, INDIGO
+GOOD_COLOR, BAD_COLOR, TOTAL_COLOR = GREEN, RED, SKY
 
 # --------------------------------------------------------------------------
 # Line icons (Lucide-style SVG paths)
@@ -108,10 +128,10 @@ def svg(name: str, size: int = 20, color: str = "currentColor") -> str:
 
 # status -> (icon, background, accent)
 STATUS_STYLE = {
-    "Idle": ("power", GRAY_LIGHT, TEXT_MUTED),
-    "Running": ("power", GREEN_LIGHT, GREEN),
-    "Calibration": ("sliders", BLUE_LIGHT, BLUE),
-    "Fault": ("power", RED_LIGHT, RED),
+    "Idle": ("power", GRAY_BG, TEXT_MUTED),
+    "Running": ("power", GREEN_BG, GREEN),
+    "Calibration": ("sliders", SKY_BG, SKY),
+    "Fault": ("power", RED_BG, RED),
 }
 
 # --------------------------------------------------------------------------
@@ -122,7 +142,7 @@ CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-.stApp { background: %GRAYBG%; }
+.stApp { background: %BG%; color: %TEXT_MAIN%; }
 #MainMenu, footer { visibility: hidden; }
 header[data-testid="stHeader"] { background: transparent; }
 
@@ -131,37 +151,38 @@ header[data-testid="stHeader"] { background: transparent; }
     padding: 1.4rem 2rem 3rem 2rem !important;
 }
 
-h1, h2, h3 { color: %TEXT_DARK% !important; font-weight: 800 !important; letter-spacing: -0.02em; }
-p, label { color: %TEXT_DARK%; }
+h1, h2, h3, h4 { color: %TEXT_MAIN% !important; font-weight: 800 !important; letter-spacing: -0.02em; }
+p, label, li { color: %TEXT_MAIN%; }
+[data-testid="stCaptionContainer"], .stCaption { color: %TEXT_MUTED% !important; }
+hr { border-color: %BORDER% !important; }
 
 /* ---------- Sidebar ---------- */
-[data-testid="stSidebar"] { background: %NAVY%; border-right: none; }
-[data-testid="stSidebar"] * { color: #E2E8F0 !important; }
+[data-testid="stSidebar"] { background: %SIDEBAR_BG%; border-right: 1px solid %BORDER%; }
+[data-testid="stSidebar"] * { color: %TEXT_MAIN% !important; }
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
     color: #FFFFFF !important; font-size: 1.05rem !important;
 }
 [data-testid="stSidebar"] input,
 [data-testid="stSidebar"] textarea,
 [data-testid="stSidebar"] [data-baseweb="select"] > div {
-    background-color: %NAVY_2% !important; color: #F8FAFC !important;
-    border: 1px solid #334155 !important; border-radius: 10px !important;
+    background-color: %CARD_2% !important; color: #F8FAFC !important;
+    border: 1px solid %BORDER% !important; border-radius: 10px !important;
 }
 [data-testid="stSidebar"] div.stButton > button {
-    background: %NAVY_2%; color: #F8FAFC !important; border: 1px solid #334155 !important;
+    background: %SKY% !important; border: 1px solid %SKY% !important;
 }
-[data-testid="stSidebar"] div.stButton > button:hover { background: %INDIGO%; border-color: %INDIGO% !important; }
-[data-testid="stSidebar"] div.stButton > button[kind="primary"] {
-    background: %INDIGO% !important; border-color: %INDIGO% !important;
-}
-[data-testid="stSidebar"] hr { border-color: #1E293B !important; }
-[data-testid="stSidebar"] [data-testid="stExpander"] { border: 1px solid #334155; border-radius: 10px; }
+[data-testid="stSidebar"] div.stButton > button * { color: %ON_SKY% !important; }
+[data-testid="stSidebar"] div.stButton > button:hover { background: %SKY_HOVER% !important; border-color: %SKY_HOVER% !important; }
+[data-testid="stSidebar"] hr { border-color: %BORDER% !important; }
+[data-testid="stSidebar"] [data-testid="stExpander"] { border: 1px solid %BORDER%; border-radius: 10px; }
 
 /* ---------- Top bar ---------- */
 .topbar {
     display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
-    background: linear-gradient(120deg, %NAVY% 0%, #1E1B4B 100%);
+    background: linear-gradient(120deg, #0F172A 0%, #172554 100%);
+    border: 1px solid %BORDER%;
     border-radius: 18px; padding: 18px 24px; margin-bottom: 18px;
-    box-shadow: 0 10px 30px rgba(15, 23, 42, 0.18);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
 .brand { display: flex; align-items: center; gap: 14px; }
 .brand-logo {
@@ -169,7 +190,7 @@ p, label { color: %TEXT_DARK%; }
     display: flex; align-items: center; justify-content: center; color: white;
 }
 .brand-title { color: #FFFFFF; font-size: 1.35rem; font-weight: 800; letter-spacing: -0.01em; }
-.brand-sub { color: #94A3B8; font-size: 0.82rem; font-weight: 500; margin-top: 2px; }
+.brand-sub { color: %TEXT_MUTED%; font-size: 0.82rem; font-weight: 500; margin-top: 2px; }
 .pills { display: flex; gap: 10px; flex-wrap: wrap; }
 .pill {
     display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px;
@@ -179,6 +200,7 @@ p, label { color: %TEXT_DARK%; }
 .pill .pdot { width: 8px; height: 8px; border-radius: 50%; background: #94A3B8; }
 .pill.ok .pdot { background: %GREEN%; box-shadow: 0 0 0 3px rgba(16,185,129,0.25); }
 .pill.bad .pdot { background: %RED%; box-shadow: 0 0 0 3px rgba(239,68,68,0.25); }
+.pill.manual { background: %AMBER_BG%; border-color: rgba(245,158,11,0.45); color: %AMBER%; }
 
 /* ---------- Tabs ---------- */
 .stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid %BORDER%; }
@@ -186,37 +208,45 @@ p, label { color: %TEXT_DARK%; }
     background: transparent; border-radius: 10px 10px 0 0; padding: 10px 18px;
     color: %TEXT_MUTED% !important; font-weight: 700;
 }
-.stTabs [aria-selected="true"] { color: %INDIGO% !important; background: %INDIGO_LIGHT%; }
-.stTabs [aria-selected="true"] p { color: %INDIGO% !important; }
+.stTabs [aria-selected="true"] { color: %SKY% !important; background: %SKY_BG%; }
+.stTabs [aria-selected="true"] p { color: %SKY% !important; }
 
-/* ---------- Buttons ---------- */
+/* ---------- Buttons (light blue) ---------- */
 div.stButton > button {
     font-size: 0.88rem !important; padding: 0.55rem 0.9rem !important; height: auto !important;
-    border-radius: 12px !important; border: 1px solid %BORDER% !important;
-    background: #ffffff; color: %TEXT_DARK% !important; font-weight: 700 !important;
-    transition: transform 0.12s ease, box-shadow 0.12s ease;
+    border-radius: 12px !important; border: 1px solid %SKY% !important;
+    background: %SKY% !important; color: %ON_SKY% !important; font-weight: 700 !important;
+    transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
 }
+div.stButton > button p, div.stButton > button span { color: inherit !important; }
 div.stButton > button:hover:not(:disabled) {
-    transform: translateY(-1px); box-shadow: 0 8px 20px rgba(15,23,42,0.10);
-    border-color: %INDIGO% !important;
+    transform: translateY(-1px); box-shadow: 0 8px 20px rgba(125,211,252,0.25);
+    background: %SKY_HOVER% !important; border-color: %SKY_HOVER% !important;
 }
-div.stButton > button:disabled { opacity: 0.45; }
+div.stButton > button:disabled { opacity: 0.35; }
 
+/* Start / Stop keep their colours - safety-critical */
 .st-key-start_btn div.stButton > button {
-    background: %GREEN% !important; color: white !important; border: none !important; padding: 0.8rem 0.9rem !important; font-size: 0.95rem !important;
+    background: %GREEN% !important; color: white !important; border: none !important;
+    padding: 0.8rem 0.9rem !important; font-size: 0.95rem !important;
 }
 .st-key-stop_btn div.stButton > button {
-    background: %RED% !important; color: white !important; border: none !important; padding: 0.8rem 0.9rem !important; font-size: 0.95rem !important;
+    background: %RED% !important; color: white !important; border: none !important;
+    padding: 0.8rem 0.9rem !important; font-size: 0.95rem !important;
 }
-.st-key-cal_btn div.stButton > button {
-    background: %BLUE% !important; color: white !important; border: none !important;
+.st-key-start_btn div.stButton > button:hover:not(:disabled) { background: #34D399 !important; }
+.st-key-stop_btn div.stButton > button:hover:not(:disabled) { background: #F87171 !important; }
+
+/* ---------- Inputs in main area ---------- */
+[data-baseweb="select"] > div, .stTextInput input, .stNumberInput input {
+    background-color: %CARD_2% !important; color: %TEXT_MAIN% !important; border-color: %BORDER% !important;
 }
 
 /* ---------- KPI cards ---------- */
 .kpi {
-    background: #ffffff; border: 1px solid %BORDER%; border-radius: 16px; padding: 16px 18px;
+    background: %CARD%; border: 1px solid %BORDER%; border-radius: 16px; padding: 16px 18px;
     display: flex; align-items: center; gap: 14px; height: 98px; box-sizing: border-box;
-    box-shadow: 0 1px 3px rgba(15,23,42,0.05); position: relative; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3); position: relative; overflow: hidden;
 }
 .kpi::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--accent); }
 .kpi-icon {
@@ -228,22 +258,34 @@ div.stButton > button:disabled { opacity: 0.45; }
 
 /* ---------- Panel cards ---------- */
 .panel-title {
-    display: flex; align-items: center; gap: 8px; font-size: 0.95rem; font-weight: 700; color: %TEXT_DARK%;
+    display: flex; align-items: center; gap: 8px; font-size: 0.95rem; font-weight: 700; color: %TEXT_MAIN%;
 }
 .panel-sub { font-size: 0.8rem; color: %TEXT_MUTED%; margin-top: 2px; }
 .st-key-ctrl_card, .st-key-chart_card, .st-key-side_card {
-    background: #ffffff; border: 1px solid %BORDER%; border-radius: 16px; padding: 18px 20px;
-    box-shadow: 0 1px 3px rgba(15,23,42,0.05);
+    background: %CARD%; border: 1px solid %BORDER%; border-radius: 16px; padding: 18px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
 }
 .section-label {
     font-size: 0.72rem; color: %TEXT_MUTED%; font-weight: 700; text-transform: uppercase;
     letter-spacing: 0.07em; margin: 14px 0 6px 0;
 }
 
+/* ---------- Servo mode chip ---------- */
+.mode-chip {
+    display: flex; width: 100%; border: 1px solid %BORDER%; border-radius: 12px; overflow: hidden;
+    background: %CARD_2%; margin-bottom: 8px;
+}
+.mode-chip span {
+    flex: 1; text-align: center; padding: 9px 0; font-size: 0.8rem; font-weight: 700;
+    letter-spacing: 0.04em; color: %TEXT_MUTED%;
+}
+.mode-chip span.on { background: %SKY%; color: %ON_SKY%; }
+.mode-chip span.on-manual { background: %AMBER%; color: %ON_SKY%; }
+
 /* ---------- Camera monitor ---------- */
 .cam-panel {
-    background: %NAVY%; border-radius: 16px; padding: 14px 16px 12px 16px;
-    box-shadow: 0 10px 30px rgba(15,23,42,0.20);
+    background: %CARD%; border: 1px solid %BORDER%; border-radius: 16px; padding: 14px 16px 12px 16px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
 }
 .cam-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .cam-title { display: flex; align-items: center; gap: 8px; color: #F8FAFC; font-weight: 700; font-size: 0.95rem; }
@@ -260,13 +302,13 @@ div.stButton > button:disabled { opacity: 0.45; }
 .cam-view {
     position: relative; width: 100%; aspect-ratio: 16 / 9; background: #020617; border-radius: 12px;
     overflow: hidden; display: flex; align-items: center; justify-content: center;
-    border: 1px solid #1E293B;
+    border: 1px solid %BORDER%;
 }
 .cam-view img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .cam-empty { text-align: center; color: #64748B; font-size: 0.85rem; padding: 0 20px; }
 .cam-empty svg { opacity: 0.6; margin-bottom: 8px; }
 .cam-empty b { color: #94A3B8; display: block; font-size: 0.95rem; margin-bottom: 2px; }
-.corner { position: absolute; width: 22px; height: 22px; border-color: rgba(255,255,255,0.55); border-style: solid; }
+.corner { position: absolute; width: 22px; height: 22px; border-color: rgba(125,211,252,0.6); border-style: solid; }
 .c-tl { top: 10px; left: 10px; border-width: 2px 0 0 2px; border-radius: 4px 0 0 0; }
 .c-tr { top: 10px; right: 10px; border-width: 2px 2px 0 0; border-radius: 0 4px 0 0; }
 .c-bl { bottom: 10px; left: 10px; border-width: 0 0 2px 2px; border-radius: 0 0 0 4px; }
@@ -280,7 +322,7 @@ div.stButton > button:disabled { opacity: 0.45; }
 .cam-foot .sq { width: 9px; height: 9px; border-radius: 3px; }
 
 /* ---------- Legend ---------- */
-.legend-row { text-align: right; font-weight: 600; color: %TEXT_DARK%; font-size: 0.82rem; }
+.legend-row { text-align: right; font-weight: 600; color: %TEXT_MAIN%; font-size: 0.82rem; }
 .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin: 0 4px 0 12px; vertical-align: middle; }
 
 /* ---------- Responsive ---------- */
@@ -293,9 +335,10 @@ div.stButton > button:disabled { opacity: 0.45; }
 </style>
 """
 _tokens = {
-    "%GRAYBG%": "#F4F6FB", "%TEXT_DARK%": TEXT_DARK, "%TEXT_MUTED%": TEXT_MUTED,
-    "%NAVY_2%": NAVY_2, "%NAVY%": NAVY, "%INDIGO_LIGHT%": INDIGO_LIGHT, "%INDIGO%": INDIGO,
-    "%GREEN%": GREEN, "%RED%": RED, "%BLUE%": BLUE, "%BORDER%": BORDER,
+    "%BG%": BG, "%SIDEBAR_BG%": SIDEBAR_BG, "%CARD_2%": CARD_2, "%CARD%": CARD,
+    "%BORDER%": BORDER, "%TEXT_MAIN%": TEXT_MAIN, "%TEXT_MUTED%": TEXT_MUTED,
+    "%SKY_HOVER%": SKY_HOVER, "%SKY_BG%": SKY_BG, "%SKY%": SKY, "%ON_SKY%": ON_SKY,
+    "%GREEN%": GREEN, "%RED%": RED, "%AMBER_BG%": AMBER_BG, "%AMBER%": AMBER,
 }
 for _k, _v in _tokens.items():
     CSS = CSS.replace(_k, _v)
@@ -306,7 +349,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 # Helpers
 # --------------------------------------------------------------------------
 def kpi_card(icon: str, icon_bg: str, accent: str, label: str, value, value_color=None):
-    vc = value_color or TEXT_DARK
+    vc = value_color or TEXT_MAIN
     st.markdown(
         f"<div class='kpi' style='--accent:{accent};'>"
         f"<div class='kpi-icon' style='background:{icon_bg};'>{svg(icon, 22, accent)}</div>"
@@ -316,7 +359,7 @@ def kpi_card(icon: str, icon_bg: str, accent: str, label: str, value, value_colo
     )
 
 
-def panel_title(icon: str, title: str, sub: str = "", color: str = INDIGO):
+def panel_title(icon: str, title: str, sub: str = "", color: str = SKY):
     sub_html = f"<div class='panel-sub'>{sub}</div>" if sub else ""
     st.markdown(
         f"<div class='panel-title'>{svg(icon, 18, color)} {title}</div>{sub_html}",
@@ -359,7 +402,7 @@ def camera_panel(cam_frame, connected: bool):
         ts = ""
     st.markdown(
         "<div class='cam-panel'>"
-        f"<div class='cam-head'><div class='cam-title'>{svg('camera', 18, '#A5B4FC')} Live Camera Feed</div>{badge}</div>"
+        f"<div class='cam-head'><div class='cam-title'>{svg('camera', 18, SKY)} Live Camera Feed</div>{badge}</div>"
         f"<div class='cam-view'>{inner}"
         "<div class='corner c-tl'></div><div class='corner c-tr'></div>"
         f"<div class='corner c-bl'></div><div class='corner c-br'></div>{ts}</div>"
@@ -375,9 +418,9 @@ def camera_panel(cam_frame, connected: bool):
 def _chart_theme(chart):
     return (
         chart.configure_view(strokeWidth=0)
-        .configure_axis(gridColor="#F1F5F9", domainColor=BORDER, tickColor=BORDER,
+        .configure_axis(gridColor="#1F2937", domainColor=BORDER, tickColor=BORDER,
                         labelColor=TEXT_MUTED, titleColor=TEXT_MUTED, labelFont="Inter", titleFont="Inter")
-        .configure_legend(labelColor=TEXT_DARK, titleColor=TEXT_DARK, orient="top")
+        .configure_legend(labelColor=TEXT_MAIN, titleColor=TEXT_MAIN, orient="top")
     )
 
 
@@ -397,7 +440,7 @@ def trend_chart(df: pd.DataFrame, height=280):
             ),
             tooltip=["time", "type", "count"],
         )
-        .properties(height=height, background="white")
+        .properties(height=height, background=CARD)
         .interactive()
     )
     return _chart_theme(chart)
@@ -417,7 +460,7 @@ def good_bad_bar(good: int, bad: int, height=240):
             ),
             tooltip=["Category", "Count"],
         )
-        .properties(height=height, background="white")
+        .properties(height=height, background=CARD)
     )
     return _chart_theme(chart)
 
@@ -450,6 +493,48 @@ def end_active_session(good: int, bad: int):
     st.session_state.live_series = []
 
 
+def send_wifi_credentials():
+    """Button callback: send the typed SSID/password to the Pi as a WIFI command.
+
+    The password is cleared from the form right after sending and is never stored
+    anywhere else by the dashboard.
+    """
+    ssid = (st.session_state.get("wifi_ssid") or "").strip()
+    password = st.session_state.get("wifi_pass") or ""
+    bridge = st.session_state.bridge
+    if bridge is None:
+        msg = ("error", "Connect to the Pi first (Cloud or WebSocket), then send the WiFi details.")
+    elif not ssid:
+        msg = ("error", "Enter the WiFi name (SSID).")
+    elif len(ssid.encode("utf-8")) > 32:
+        msg = ("error", "A WiFi name can be at most 32 bytes long.")
+    elif password and not 8 <= len(password) <= 63:
+        msg = ("error", "A WPA/WPA2 password must be 8 to 63 characters (leave empty for an open network).")
+    else:
+        payload = base64.b64encode(
+            json.dumps({"ssid": ssid, "password": password}).encode("utf-8")
+        ).decode("ascii")
+        if bridge.send_command("WIFI:" + payload):
+            msg = ("success", f"Sent. The Pi is joining '{ssid}'. Watch the status below.")
+            st.session_state.wifi_pass = ""
+        else:
+            msg = ("error", "Could not send the WiFi details. Check the connection.")
+    st.session_state.wifi_msg = msg
+
+
+@st.fragment(run_every=2)
+def pi_network_status():
+    """Shows what the Pi reports about its WiFi (refreshes without a full rerun)."""
+    b = st.session_state.bridge
+    if b is None:
+        return
+    snap = b.get_snapshot()
+    if snap.get("wifi"):
+        st.caption(f"Pi WiFi: {snap['wifi']}")
+    if snap.get("pi_ip"):
+        st.caption(f"Pi address: `{snap['pi_ip']}`")
+
+
 # --------------------------------------------------------------------------
 # Sidebar - connection settings
 # --------------------------------------------------------------------------
@@ -459,17 +544,22 @@ with st.sidebar:
     mode = st.radio(
         "Mode", MODE_OPTIONS, index=MODE_OPTIONS.index(st.session_state.mode),
         help="Cloud: Pi + dashboard talk over the internet via Firebase.\n"
-             "Live: wired by USB, same computer.\nSimulation: demo with fake data.",
+             "WebSocket: direct link, needs this computer and the Pi on the same WiFi. "
+             "Much lower delay.",
     )
     st.session_state.mode = mode
 
-    port, baud = None, None
     db_url = DEFAULT_FIREBASE_URL
-    if mode.startswith("Live"):
-        port = st.text_input("Serial port", value="COM3",
-                             help="e.g. COM3 on Windows, /dev/ttyACM0 on Linux/Pi.")
-        baud = st.number_input("Baud rate", value=9600, step=1)
-    elif mode.startswith("Cloud"):
+    ws_host, ws_port, ws_key = DEFAULT_PI_HOST, DEFAULT_WS_PORT, DEFAULT_WS_KEY
+    if mode.startswith("WebSocket"):
+        ws_host = st.text_input("Pi address", value=DEFAULT_PI_HOST, key="ws_host",
+                                help="Hostname or IP of the Raspberry Pi, e.g. raspberrypi.local "
+                                     "or 192.168.1.50. In Cloud mode the Pi reports its IP below.")
+        ws_key = st.text_input("Access key", value=DEFAULT_WS_KEY, type="password", key="ws_key",
+                               help="Must match WS_ACCESS_KEY in sorter_agent.py.")
+        with st.expander("Advanced", expanded=False):
+            ws_port = st.number_input("Port", value=DEFAULT_WS_PORT, step=1, key="ws_port")
+    else:
         # Pre-filled and saved in the code — only open this to point at another database.
         with st.expander("Firebase database", expanded=False):
             db_url = st.text_input("Database URL", value=DEFAULT_FIREBASE_URL,
@@ -482,15 +572,18 @@ with st.sidebar:
         if st.button("Connect", use_container_width=True, type="primary", icon=":material/power:"):
             if st.session_state.bridge:
                 st.session_state.bridge.disconnect()
+            st.session_state.bridge = None
             bridge = None
-            if mode.startswith("Live"):
-                bridge = SerialBridge(port, int(baud))
-            elif mode.startswith("Cloud"):
-                bridge = CloudBridge(db_url.strip()) if db_url and db_url.strip() else None
+            if mode.startswith("WebSocket"):
+                if not ws_host.strip():
+                    st.error("Enter the Pi address.")
+                else:
+                    bridge = WebSocketBridge(ws_host.strip(), int(ws_port), ws_key)
+            else:
+                clean_url = db_url.strip().rstrip("/") if db_url else ""
+                bridge = CloudBridge(clean_url) if clean_url else None
                 if bridge is None:
                     st.error("Firebase URL is empty.")
-            else:
-                bridge = SimulationBridge()
             if bridge is not None:
                 bridge.connect()
                 st.session_state.bridge = bridge
@@ -511,6 +604,24 @@ with st.sidebar:
         else:
             st.error(f"Connection failed: {snap.get('error') or 'unknown error'}")
 
+    # ---------- Pi WiFi setup ----------
+    st.divider()
+    with st.expander("Pi WiFi setup", expanded=False):
+        st.caption(
+            "Tell the Pi which WiFi network to join, so the dashboard can reach it over "
+            "WebSocket. Connect in Cloud mode first if the Pi is on a different network. "
+            "Use the same network your ESP8266 is on, and put this computer on it too."
+        )
+        st.text_input("WiFi name (SSID)", key="wifi_ssid")
+        st.text_input("WiFi password", type="password", key="wifi_pass")
+        st.button("Send WiFi to Pi", use_container_width=True, key="wifi_send",
+                  on_click=send_wifi_credentials, icon=":material/wifi:")
+        _wm = st.session_state.wifi_msg
+        if _wm:
+            getattr(st, _wm[0])(_wm[1])
+        pi_network_status()
+        st.caption("Only works while the machine is Idle. The password is not stored by the dashboard.")
+
     st.divider()
     show_camera = st.checkbox("Show camera feed", value=True)
 
@@ -524,13 +635,18 @@ with st.sidebar:
 
     with st.expander("Protocol reference"):
         st.caption(
-            "**USB protocol** — in: `0`/`1` (bad/good, per-seed) · `GOOD`/`BAD` · "
-            "`COUNTS:<g>,<b>` · `STATUS:IDLE/RUNNING/CALIBRATION/FAULT` · "
-            "`DIVERTER:READY/DIVERTING` — out: `START`/`STOP`/`CALIBRATE`/"
-            "`SPD1`/`SPD2`/`SPD3`/`SERVO50`/`SERVO100`/`SERVO150`/`SERVO180`\n\n"
+            "**WebSocket protocol** — `ws://<pi>:8765`. First message: "
+            "`{\"type\":\"auth\",\"key\":...}`. Pi sends JSON `status` messages and "
+            "binary JPEG frames. Dashboard sends `{\"type\":\"cmd\",\"cmd\":...}`.\n\n"
             "**Cloud protocol** — Firebase keys: `good`, `bad` (running totals), "
             "`status` (Idle/Running/Calibration/Fault), `diverter` (Ready/Diverting), "
             "`camera_frame`, `command`.\n\n"
+            "**Commands (both modes)** — `START`/`STOP`/`CALIBRATE`/"
+            "`SPD1`/`SPD2`/`SPD3`/`AUTO`/`MANUAL`/"
+            "`SERVO50`/`SERVO100`/`SERVO150`/`SERVO180`/`SERVO<0-180>`/"
+            "`WIFI:<base64 json>`\n\n"
+            "**Servo modes** — `AUTO`: gate follows the vision classifier. "
+            "`MANUAL`: gate only moves on `SERVO<angle>` commands from this dashboard.\n\n"
             "**Speed levels** — 3.75 / 6.2 / 7.4 cm/s (level 1 is measured; "
             "2 and 3 are still computed estimates)."
         )
@@ -545,6 +661,9 @@ else:
     _s = _b.get_snapshot()
     conn_cls, conn_txt = ("ok", "Connected") if _s["connected"] else ("bad", "Connection failed")
 mode_short = mode.split(" (")[0]
+_manual_now = st.session_state.servo_mode == SERVO_MANUAL
+servo_pill_cls = "pill manual" if _manual_now else "pill"
+servo_pill_txt = f"Servo: {st.session_state.servo_mode}"
 
 st.markdown(
     "<div class='topbar'>"
@@ -552,6 +671,7 @@ st.markdown(
     "<div><div class='brand-title'>Seed Sorting Control Center</div>"
     "<div class='brand-sub'>Real-time monitoring and control for the automated maize sorting system</div></div></div>"
     f"<div class='pills'><span class='pill'>{svg('wifi', 14, '#CBD5E1')} {mode_short} mode</span>"
+    f"<span class='{servo_pill_cls}'>{svg('sliders', 14, 'currentColor')} {servo_pill_txt}</span>"
     f"<span class='pill {conn_cls}'><span class='pdot'></span>{conn_txt}</span></div>"
     "</div>",
     unsafe_allow_html=True,
@@ -578,6 +698,7 @@ with tab_live:
 
         total = good + bad
         good_pct = (good / total * 100) if total else 0.0
+        manual = st.session_state.servo_mode == SERVO_MANUAL
 
         series = st.session_state.live_series
         if st.session_state.active_session and (
@@ -596,16 +717,16 @@ with tab_live:
                      status if status in STATUS_STYLE else "Idle", value_color=s_color)
         with k2:
             if diverter == "Diverting":
-                d_bg, d_color = AMBER_LIGHT, AMBER
+                d_bg, d_color = AMBER_BG, AMBER
             else:
-                d_bg, d_color = GRAY_LIGHT, TEXT_MUTED
+                d_bg, d_color = GRAY_BG, TEXT_MUTED
             kpi_card("shuffle", d_bg, d_color, "Diverter", diverter, value_color=d_color)
         with k3:
-            kpi_card("check", GREEN_LIGHT, GREEN, "Good Seeds", f"{good:,}")
+            kpi_card("check", GREEN_BG, GREEN, "Good Seeds", f"{good:,}")
         with k4:
-            kpi_card("x", RED_LIGHT, RED, "Bad / Defective", f"{bad:,}")
+            kpi_card("x", RED_BG, RED, "Bad / Defective", f"{bad:,}")
         with k5:
-            kpi_card("layers", INDIGO_LIGHT, INDIGO, "Total Counted", f"{total:,}")
+            kpi_card("layers", SKY_BG, SKY, "Total Counted", f"{total:,}")
 
         st.write("")
 
@@ -682,21 +803,65 @@ with tab_live:
                         else:
                             st.error("Failed to send CALIBRATE command.")
 
-                st.markdown("<div class='section-label'>Servo bring-up test (Idle only)</div>",
+                # ---------- Servo control: autonomous <-> manual ----------
+                st.markdown("<div class='section-label'>Servo control mode</div>",
                             unsafe_allow_html=True)
+                auto_cls = "" if manual else "on"
+                man_cls = "on-manual" if manual else ""
+                st.markdown(
+                    f"<div class='mode-chip'><span class='{auto_cls}'>AUTONOMOUS</span>"
+                    f"<span class='{man_cls}'>MANUAL</span></div>",
+                    unsafe_allow_html=True,
+                )
+                toggle_label = "Switch to AUTONOMOUS" if manual else "Switch to MANUAL"
+                toggle_icon = ":material/smart_toy:" if manual else ":material/pan_tool:"
+                with st.container(key="mode_btn"):
+                    if st.button(toggle_label, use_container_width=True,
+                                 key="servo_mode_toggle", icon=toggle_icon):
+                        bridge = st.session_state.bridge
+                        if bridge is None:
+                            st.error("Connect to the machine first (see sidebar).")
+                        else:
+                            new_mode = SERVO_AUTO if manual else SERVO_MANUAL
+                            cmd = "AUTO" if new_mode == SERVO_AUTO else "MANUAL"
+                            if bridge.send_command(cmd):
+                                st.session_state.servo_mode = new_mode
+                                st.toast(f"Servo is now {new_mode.upper()}",
+                                         icon="🤖" if new_mode == SERVO_AUTO else "🖐️")
+                                st.rerun()  # refresh top bar + button states
+                            else:
+                                st.error(f"Failed to send {cmd} command.")
+
+                if manual:
+                    st.caption("Manual: the gate only moves when you press an angle below.")
+                else:
+                    st.caption("Autonomous: the gate follows the vision classifier. "
+                               "Switch to Manual to enable the angle controls.")
+
                 sv_cols = st.columns(4)
                 for col, angle in zip(sv_cols, (50, 100, 150, 180)):
                     with col:
                         if st.button(f"{angle}°", use_container_width=True,
-                                     key=f"servo_{angle}", disabled=(status != "Idle")):
+                                     key=f"servo_{angle}", disabled=not manual):
                             bridge = st.session_state.bridge
                             if bridge is None:
                                 st.error("Connect to the machine first (see sidebar).")
                             elif bridge.send_command(f"SERVO{angle}"):
                                 st.toast(f"Servo moved to {angle}°", icon="🔧")
                             else:
-                                st.error("Failed to send servo test command.")
-                st.caption("Moves the gate directly, bypassing the FIFO.")
+                                st.error("Failed to send servo command.")
+
+                custom_angle = st.slider("Custom angle", 0, 180, 90, step=1,
+                                         key="servo_custom_angle", disabled=not manual)
+                if st.button(f"Move gate to {custom_angle}°", use_container_width=True,
+                             key="servo_custom_go", disabled=not manual):
+                    bridge = st.session_state.bridge
+                    if bridge is None:
+                        st.error("Connect to the machine first (see sidebar).")
+                    elif bridge.send_command(f"SERVO{custom_angle}"):
+                        st.toast(f"Servo moved to {custom_angle}°", icon="🔧")
+                    else:
+                        st.error("Failed to send servo command.")
 
         st.write("")
 
@@ -722,7 +887,7 @@ with tab_live:
                         f"<div class='legend-row'>"
                         f"<span class='legend-dot' style='background:{GREEN};'></span>Good"
                         f"<span class='legend-dot' style='background:{RED};'></span>Bad"
-                        f"<span class='legend-dot' style='background:{INDIGO};'></span>Total</div>",
+                        f"<span class='legend-dot' style='background:{SKY};'></span>Total</div>",
                         unsafe_allow_html=True,
                     )
                 st.altair_chart(trend_chart(df, height=270), use_container_width=True)
@@ -774,13 +939,13 @@ with tab_history:
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            kpi_card("check", GREEN_LIGHT, GREEN, "Good", f"{chosen['good']:,}")
+            kpi_card("check", GREEN_BG, GREEN, "Good", f"{chosen['good']:,}")
         with c2:
-            kpi_card("x", RED_LIGHT, RED, "Bad", f"{chosen['bad']:,}")
+            kpi_card("x", RED_BG, RED, "Bad", f"{chosen['bad']:,}")
         with c3:
-            kpi_card("layers", INDIGO_LIGHT, INDIGO, "Total", f"{chosen['total']:,}")
+            kpi_card("layers", SKY_BG, SKY, "Total", f"{chosen['total']:,}")
         with c4:
-            kpi_card("percent", BLUE_LIGHT, BLUE, "Good rate", f"{chosen['good_pct']:.1f}%")
+            kpi_card("percent", SKY_BG, SKY, "Good rate", f"{chosen['good_pct']:.1f}%")
 
         st.write("")
         if chosen["series"]:
